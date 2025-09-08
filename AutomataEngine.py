@@ -548,3 +548,330 @@ def build_nfa_from_regex(regex: str, eps_symbol: str = DEFAULT_EPS) -> Tuple[NFA
     postfix, steps, expanded = regex_to_postfix(regex)
     nfa = NFA.build_from_postfix(expanded, eps_symbol=eps_symbol)
     return nfa, postfix, steps, expanded
+
+# ======================= Subconjuntos: AFN -> AFD ============================
+@dataclass(eq=False)
+class DfaState:
+    id: int
+    trans: Dict[str, int]
+    accept: bool
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+
+class DFA:
+    def __init__(self, alphabet: Set[str]):
+        self.states: Dict[int, DfaState] = {}
+        self.start: Optional[int] = None
+        self.alphabet: Set[str] = set(alphabet)  # puede incluir OTHER
+
+    def add_state(self, accept: bool=False) -> int:
+        i = len(self.states)
+        self.states[i] = DfaState(i, {}, accept)
+        if self.start is None:
+            self.start = i
+        return i
+
+    def add_trans(self, u: int, a: str, v: int):
+        self.states[u].trans[a] = v
+
+    def accepts(self, w: str) -> bool:
+        if self.start is None:
+            return False
+        cur = self.start
+        for ch in w:
+            s = self.states[cur]
+            if ch in s.trans:
+                cur = s.trans[ch]
+            elif OTHER in s.trans:
+                cur = s.trans[OTHER]
+            else:
+                return False
+        return self.states[cur].accept
+
+    def complete_with_sink(self) -> int:
+        sink = None
+        for st in self.states.values():
+            for a in self.alphabet:
+                if a not in st.trans:
+                    if sink is None:
+                        sink = self.add_state(False)
+                    st.trans[a] = sink
+        if sink is None:
+            sink = self.add_state(False)
+        for a in self.alphabet:
+            self.states[sink].trans[a] = sink
+        return sink
+
+
+def nfa_alphabet(nfa: NFA) -> Set[str]:
+    Σ: Set[str] = set()
+    for s in nfa.states:
+        for a in s.trans.keys():
+            if a != "ANY":
+                Σ.add(a)
+    return Σ
+
+
+def eclosure(nfa: NFA, S: Set[int]) -> Set[int]:
+    return nfa.eclosure(S)
+
+
+def move_set(nfa: NFA, S: Set[int], sym: str) -> Set[int]:
+    T: Set[int] = set()
+    for u in S:
+        T |= set(nfa.states[u].trans.get(sym, []))
+    return T
+
+
+def build_dfa_from_nfa(nfa: NFA) -> Tuple[DFA, Dict[FrozenSet[int], int]]:
+    Σ = nfa_alphabet(nfa)
+    has_any = any("ANY" in s.trans for s in nfa.states)
+    alphabet = set(Σ)
+    if has_any:
+        alphabet.add(OTHER)
+
+    dfa = DFA(alphabet=alphabet)
+    subset_id: Dict[FrozenSet[int], int] = {}
+
+    start_set = eclosure(nfa, {nfa.start})
+    start_key = frozenset(start_set)
+    start_id = dfa.add_state(accept=(nfa.accept in start_set))
+    subset_id[start_key] = start_id
+
+    Q = deque([start_key])
+    while Q:
+        T = Q.popleft()
+        u = subset_id[T]
+        for a in Σ:
+            U_raw = move_set(nfa, T, a)
+            if has_any:
+                U_raw |= move_set(nfa, T, "ANY")
+            U = eclosure(nfa, U_raw)
+            key = frozenset(U)
+            if key not in subset_id:
+                qid = dfa.add_state(accept=(nfa.accept in U))
+                subset_id[key] = qid
+                Q.append(key)
+            dfa.add_trans(u, a, subset_id[key])
+
+        if has_any:
+            U_raw = move_set(nfa, T, "ANY")
+            U = eclosure(nfa, U_raw)
+            key = frozenset(U)
+            if key not in subset_id:
+                qid = dfa.add_state(accept=(nfa.accept in U))
+                subset_id[key] = qid
+                Q.append(key)
+            dfa.add_trans(u, OTHER, subset_id[key])
+    return dfa, subset_id
+
+
+# =============================== Minimización ================================
+def clone_dfa(dfa: DFA) -> DFA:
+    c = DFA(alphabet=set(dfa.alphabet))
+    id_map = {}
+    for sid in dfa.states:
+        id_map[sid] = c.add_state(dfa.states[sid].accept)
+    c.start = id_map[dfa.start]
+    for u, st in dfa.states.items():
+        for a, v in st.trans.items():
+            c.add_trans(id_map[u], a, id_map[v])
+    return c
+
+
+def hopcroft_minimize(dfa: DFA) -> DFA:
+    sink = dfa.complete_with_sink()
+    Σ = sorted(dfa.alphabet)
+    states = list(dfa.states.keys())
+    F = {s.id for s in dfa.states.values() if s.accept}
+    NF = set(dfa.states.keys()) - F
+
+    # Partición inicial
+    P: List[Set[int]] = []
+    if F:  P.append(F)
+    if NF: P.append(NF)
+    W: List[Set[int]] = [min(F, key=len) if F else set()] if F else [NF]
+
+    while W:
+        A = W.pop()
+        for a in Σ:
+            # X = {q | δ(q,a) ∈ A}
+            X = set()
+            for q in states:
+                if dfa.states[q].trans.get(a, None) in A:
+                    X.add(q)
+            newP: List[Set[int]] = []
+            for Y in P:
+                inter = Y & X
+                diff = Y - X
+                if inter and diff:
+                    newP.extend([inter, diff])
+                    if Y in W:
+                        W.remove(Y)
+                        W.extend([inter, diff])
+                    else:
+                        W.append(inter if len(inter) <= len(diff) else diff)
+                else:
+                    newP.append(Y)
+            P = newP
+
+    # Construcción del DFA mínimo
+    block_id: Dict[int, int] = {}
+    for i, block in enumerate(P):
+        for s in block:
+            block_id[s] = i
+
+    min_dfa = DFA(alphabet=set(dfa.alphabet))
+    new_state_map: Dict[int, int] = {}
+    for i, block in enumerate(P):
+        accept = any(dfa.states[s].accept for s in block)
+        new_state_map[i] = min_dfa.add_state(accept)
+
+    for i, block in enumerate(P):
+        rep = next(iter(block))
+        for a in dfa.alphabet:
+            to_old = dfa.states[rep].trans[a]
+            j = block_id[to_old]
+            min_dfa.add_trans(new_state_map[i], a, new_state_map[j])
+
+    if dfa.start is not None:
+        min_dfa.start = new_state_map[block_id[dfa.start]]
+    return min_dfa
+
+
+# ============================== Dibujo AFD ===================================
+def layout_positions_dfa(dfa: DFA) -> Dict[int, Tuple[float, float]]:
+    adj = {i: set(s.trans.values()) for i, s in dfa.states.items()}
+    dist: Dict[int, int] = {}
+    if dfa.start is not None:
+        dist[dfa.start] = 0
+        q = deque([dfa.start])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in dist:
+                    dist[v] = dist[u] + 1
+                    q.append(v)
+    maxd = max(dist.values()) if dist else 0
+    for s in dfa.states:
+        dist.setdefault(s, maxd)
+    levels: Dict[int, List[int]] = {}
+    for s, d in dist.items():
+        levels.setdefault(d, []).append(s)
+    pos: Dict[int, Tuple[float, float]] = {}
+    sep_x, sep_y = 2.6, 1.6
+    for d in sorted(levels):
+        ys = sorted(levels[d])
+        n = len(ys)
+        for i, s in enumerate(ys):
+            y = (i - (n - 1) / 2.0) * sep_y
+            x = d * sep_x
+            pos[s] = (x, y)
+    return pos
+
+
+from matplotlib.patches import Circle, FancyArrowPatch, Arc
+
+def draw_dfa_png(dfa: DFA, filename_png: str):
+    pos = layout_positions_dfa(dfa)
+    xs = [p[0] for p in pos.values()] + [0]
+    ys = [p[1] for p in pos.values()] + [0]
+    x_min, x_max = min(xs) - 1.2, max(xs) + 1.2
+    y_min, y_max = min(ys) - 1.2, max(ys) + 1.2
+
+    fig, ax = plt.subplots(figsize=(max(6, (x_max - x_min) * 1.2),
+                                    max(4, (y_max - y_min) * 1.2)))
+    ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max)
+    ax.axis("off")
+    R = 0.28
+
+    labels = defaultdict(list)
+    for u, s in dfa.states.items():
+        circ = Circle((pos[u][0], pos[u][1]), R, fill=False, lw=2)
+        ax.add_patch(circ)
+        if s.accept:
+            circ2 = Circle((pos[u][0], pos[u][1]), R - 0.06, fill=False, lw=2)
+            ax.add_patch(circ2)
+        ax.text(pos[u][0], pos[u][1], str(u), ha="center", va="center", fontsize=10)
+        if dfa.start == u:
+            arr = FancyArrowPatch((-2, pos[u][1]), (pos[u][0] - R, pos[u][1]), arrowstyle="->", lw=1.6, mutation_scale=14)
+            ax.add_patch(arr)
+        for a, v in s.trans.items():
+            labels[(u, v)].append(a)
+
+    for (u, v), syms in labels.items():
+        x1, y1 = pos[u]; x2, y2 = pos[v]
+        if u == v:
+            arc = Arc((x1, y1 + R + 0.20), 0.8, 0.6, angle=0, theta1=220, theta2=-40, lw=1.5)
+            ax.add_patch(arc)
+            lbl = ",".join("ANY" if s == OTHER else s for s in sorted(syms))
+            ax.text(x1 + 0.05, y1 + R + 0.7, lbl, fontsize=9)
+            continue
+        arr = FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="->", lw=1.5,
+                              mutation_scale=12, shrinkA=12, shrinkB=12)
+        ax.add_patch(arr)
+        xm, ym = (x1 + x2) / 2.0, (y1 + y2) / 2.0 + 0.15
+        lbl = ",".join("ANY" if s == OTHER else s for s in sorted(syms))
+        ax.text(xm, ym, lbl, fontsize=9)
+
+    fig.tight_layout()
+    if not filename_png.lower().endswith(".png"):
+        filename_png += ".png"
+    fig.savefig(filename_png, dpi=150)
+    plt.close(fig)
+
+
+# =============================== Verificación ================================
+def dfa_equiv(d1: DFA, d2: DFA) -> bool:
+    Σ = set(d1.alphabet) | set(d2.alphabet)
+    d1c = clone_dfa(d1); d1c.alphabet = set(Σ); d1c.complete_with_sink()
+    d2c = clone_dfa(d2); d2c.alphabet = set(Σ); d2c.complete_with_sink()
+
+    start = (d1c.start, d2c.start)
+    seen = set([start])
+    Q = deque([start])
+    while Q:
+        u1, u2 = Q.popleft()
+        a1 = d1c.states[u1].accept
+        a2 = d2c.states[u2].accept
+        if a1 != a2:
+            return False
+        for a in Σ:
+            v1 = d1c.states[u1].trans[a]
+            v2 = d2c.states[u2].trans[a]
+            p = (v1, v2)
+            if p not in seen:
+                seen.add(p)
+                Q.append(p)
+    return True
+
+
+def random_words(Σ: Set[str], trials: int, max_len: int = 6, seed: int = 123) -> List[str]:
+    rng = random.Random(seed)
+    letters = sorted(Σ)
+    out: List[str] = []
+    for _ in range(trials):
+        L = rng.randint(0, max_len)
+        if letters:
+            w = "".join(rng.choice(letters) for _ in range(L))
+        else:
+            w = ""
+        out.append(w)
+    return out
+
+
+def diff_test(nfa: NFA, dfa: DFA, trials: int = 200, max_len: int = 6, alphabet_hint: Optional[str] = None) -> Tuple[int, int]:
+    Σ = set(nfa_alphabet(nfa))
+    if alphabet_hint:
+        Σ |= set(alphabet_hint)
+    words = random_words(Σ, trials=trials, max_len=max_len)
+    oks = 0; mism = 0
+    for w in words:
+        a = nfa.accepts(w)
+        b = dfa.accepts(w)
+        if a == b:
+            oks += 1
+        else:
+            mism += 1
+    return oks, mism
