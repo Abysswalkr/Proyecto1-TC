@@ -8,18 +8,25 @@ import random
 
 # ============================ Configuración básica ============================
 DEFAULT_EPS = "ε"     # configurable con --eps
-OTHER = "OTHER"       # símbolo sintético para "otros" en DFA
+OTHER = "OTHER"       # símbolo sintético para "cualquier otro" (se dibuja como ANY)
+
 
 # ============================ Tokenización / ER ===============================
 @dataclass
 class Token:
-    kind: str
+    kind: str                 # 'LIT','ANY','CLASS','LP','RP','ALT','STAR','PLUS','QMARK','CONCAT','REPEAT'
     value: Optional[str] = None
-    # kind ∈ {"LIT","CLASS","ANY","ALT","CONCAT","STAR","PLUS","QMARK","LP","RP","REPEAT"}
+
 
 def tokenize(expr: str) -> List[Token]:
     """
-    Convierte la expresión regular cruda (infix) en una lista de tokens.
+    Tokeniza respetando:
+      - Escapes: '\\x' => LIT('x')
+      - Clases:  '[ ... ]' => CLASS(contenido crudo)
+      - Punto:   '.' => ANY (cualquier carácter); '\\.' => LIT('.')
+      - Operadores: '(', ')', '|', '*', '+', '?'
+      - Repetición: '{m}', '{m,}', '{m,n}' => REPEAT('{...}')
+    Ignora espacios en blanco.
     """
     tokens: List[Token] = []
     i, n = 0, len(expr)
@@ -32,522 +39,421 @@ def tokenize(expr: str) -> List[Token]:
             else:
                 tokens.append(Token("LIT", "\\"))
                 i += 1
-        elif c in " \t\r\n":
-            i += 1
-        elif c == ".":
-            tokens.append(Token("ANY"))
-            i += 1
-        elif c in "|()*+?":
-            kind_map = {
-                "|": "ALT", "(": "LP", ")": "RP",
-                "*": "STAR", "+": "PLUS", "?": "QMARK"
-            }
-            tokens.append(Token(kind_map[c]))
-            i += 1
-        elif c == "[":
-            # clase de caracteres
+        elif c == "[":  # clase de caracteres
             j = i + 1
-            negate = False
-            if j < n and expr[j] == "^":
-                negate = True
-                j += 1
-            chars: List[str] = []
-            while j < n and expr[j] != "]":
+            contenido = ""
+            cerrado = False
+            while j < n:
                 if expr[j] == "\\" and j + 1 < n:
-                    chars.append(expr[j + 1])
+                    contenido += "\\" + expr[j + 1]
                     j += 2
-                elif j + 2 < n and expr[j + 1] == "-" and expr[j + 2] != "]":
-                    # rango a-z
-                    start, end = expr[j], expr[j + 2]
-                    chars.extend([chr(k) for k in range(ord(start), ord(end) + 1)])
-                    j += 3
-                else:
-                    chars.append(expr[j])
-                    j += 1
-            if j >= n or expr[j] != "]":
-                raise ValueError("Clase de caracteres no cerrada ']'")
-            tokens.append(Token("CLASS", ("^" if negate else "") + "".join(chars)))
-            i = j + 1
-        elif c == "{":
-            j = i + 1
-            while j < n and expr[j] != "}":
+                    continue
+                if expr[j] == "]":
+                    cerrado = True
+                    break
+                contenido += expr[j]
                 j += 1
-            if j >= n:
-                raise ValueError("Repetición '{...}' no cerrada '}'")
-            content = expr[i:j + 1]  # incluye llaves
-            tokens.append(Token("REPEAT", content))
-            i = j + 1
+            if cerrado:
+                tokens.append(Token("CLASS", contenido))
+                i = j + 1
+            else:
+                tokens.append(Token("LIT", "["))
+                i += 1
+        elif c == ".":
+            tokens.append(Token("ANY", "."))
+            i += 1
+        elif c in "()*+?|":
+            kind_map = {"(":"LP", ")":"RP", "*":"STAR", "+":"PLUS", "?":"QMARK", "|":"ALT"}
+            tokens.append(Token(kind_map[c], c))
+            i += 1
+        elif c == "{":  # cuantificadores
+            j = i + 1
+            interior = ""
+            valido = False
+            while j < n and expr[j] != "}":
+                interior += expr[j]
+                j += 1
+            if j < n and expr[j] == "}":
+                s = interior.strip()
+                if s and all(ch.isdigit() or ch == "," for ch in s):
+                    tokens.append(Token("REPEAT", "{" + s + "}"))
+                    i = j + 1
+                    valido = True
+            if not valido:
+                tokens.append(Token("LIT", "{"))
+                i += 1
+        elif c.isspace():
+            i += 1
         else:
             tokens.append(Token("LIT", c))
             i += 1
     return tokens
 
-def render_atom(t: Token) -> str:
-    if t.kind == "LIT":
-        return t.value or ""
-    if t.kind == "ANY":
-        return "."
-    if t.kind == "CLASS":
-        return f"[{t.value}]"
-    if t.kind == "REPEAT":
-        return t.value or ""
-    return t.kind
 
-def needs_concat(prev: Optional[Token], cur: Token) -> bool:
-    if prev is None:
+def render_atom(tok: Token) -> str:
+    if tok.kind == "ANY":
+        return "ANY"
+    if tok.kind == "CLASS":
+        return f"[{tok.value}]"
+    if tok.kind == "LIT" and tok.value == ".":
+        return r"\."
+    return tok.value
+
+
+def needs_concat(prev: Token, nxt: Token) -> bool:
+    starts_atom = nxt.kind in ("LIT", "ANY", "CLASS", "LP")
+    ends_atom   = prev.kind in ("LIT", "ANY", "CLASS", "RP", "STAR", "PLUS", "QMARK", "REPEAT")
+    if prev.kind in ("LP", "ALT"):
         return False
-    left = prev.kind in ("LIT", "CLASS", "ANY", "RP", "STAR", "PLUS", "QMARK", "REPEAT")
-    right = cur.kind in ("LIT", "CLASS", "ANY", "LP")
-    return left and right
+    if nxt.kind in ("RP", "ALT"):
+        return False
+    return ends_atom and starts_atom
+
 
 def add_concat(tokens: List[Token]) -> List[Token]:
-    """ Inserta tokens CONCAT explícitos donde corresponde. """
-    out: List[Token] = []
-    prev: Optional[Token] = None
+    res: List[Token] = []
     for t in tokens:
-        if needs_concat(prev, t):
-            out.append(Token("CONCAT"))
-        out.append(t)
-        prev = t
-    return out
+        if res and needs_concat(res[-1], t):
+            res.append(Token("CONCAT", "·"))
+        res.append(t)
+    return res
+
 
 # =============================== Shunting Yard ===============================
-PRECEDENCE = {
-    "ALT": 1,      # |
-    "CONCAT": 2,   # · (implícito)
-    "STAR": 3,     # *
-    "PLUS": 3,     # +
-    "QMARK": 3,    # ?
-    "REPEAT": 3,   # {m}, {m,}, {m,n}
-}
+PRECEDENCE = {"ALT": 1, "CONCAT": 2}
 
 @dataclass
 class Step:
-    out: List[str]
-    ops: List[Token]
+    i: int
+    accion: str
+    token: str
+    salida: str
+    pila: str
+
 
 def shunting_yard(tokens: List[Token]) -> Tuple[List[str], List[Step]]:
-    """
-    Devuelve la lista de símbolos en postfix y un rastro de pasos.
-    """
-    steps: List[Step] = []
     out: List[str] = []
     ops: List[Token] = []
+    pasos: List[Step] = []
 
-    def emit(tok: Token):
-        if tok.kind == "LIT":
-            out.append(tok.value or "")
-        elif tok.kind == "CLASS":
-            out.append(f"[{tok.value}]")
-        elif tok.kind == "ANY":
-            out.append(".")
+    for i, tok in enumerate(tokens):
+        if tok.kind in ("LIT", "ANY", "CLASS"):
+            atom = render_atom(tok)
+            out.append(atom)
+            pasos.append(Step(i, "EMIT", atom, " ".join(out), "".join(o.value or o.kind for o in ops)))
         elif tok.kind in ("STAR", "PLUS", "QMARK", "REPEAT"):
-            out.append(render_atom(tok))
-        elif tok.kind in ("ALT", "CONCAT"):
-            out.append(tok.kind)
-        else:
-            raise ValueError(f"Token no esperado en salida: {tok}")
-
-    def prec(tok: Token) -> int:
-        return PRECEDENCE.get(tok.kind, 0)
-
-    for t in tokens:
-        if t.kind in ("LIT", "CLASS", "ANY"):
-            emit(t)
-        elif t.kind in ("STAR", "PLUS", "QMARK", "REPEAT"):
-            emit(t)
-        elif t.kind == "LP":
-            ops.append(t)
-        elif t.kind == "RP":
+            out.append(tok.value or {"STAR":"*", "PLUS":"+", "QMARK":"?", "REPEAT":"{?}"}[tok.kind])
+            pasos.append(Step(i, "EMIT_POSF", tok.value or tok.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
+        elif tok.kind == "LP":
+            ops.append(tok)
+            pasos.append(Step(i, "PUSH", "(", " ".join(out), "".join(o.value or o.kind for o in ops)))
+        elif tok.kind == "RP":
             while ops and ops[-1].kind != "LP":
-                emit(ops.pop())
+                p = ops.pop()
+                out.append(p.value or p.kind)
+                pasos.append(Step(i, "POP->EMIT", p.value or p.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
             if not ops:
-                raise ValueError("Paréntesis no balanceados: falta '('")
-            ops.pop()  # saca '('
-        elif t.kind in ("ALT", "CONCAT"):
-            while ops and ops[-1].kind not in ("LP",) and prec(ops[-1]) >= prec(t):
-                emit(ops.pop())
-            ops.append(t)
+                raise ValueError("Paréntesis desbalanceados (falta '(')")
+            ops.pop()
+            pasos.append(Step(i, "POP", ")", " ".join(out), "".join(o.value or o.kind for o in ops)))
+        elif tok.kind in ("ALT", "CONCAT"):
+            while ops and ops[-1].kind in ("ALT", "CONCAT") and PRECEDENCE[ops[-1].kind] >= PRECEDENCE[tok.kind]:
+                p = ops.pop()
+                out.append(p.value or p.kind)
+                pasos.append(Step(i, "POP->EMIT", p.value or p.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
+            ops.append(tok)
+            pasos.append(Step(i, "PUSH", tok.value or tok.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
         else:
-            raise ValueError(f"Token desconocido: {t.kind}")
-
-        steps.append(Step(out[:], ops[:]))
+            out.append(tok.value or tok.kind)
+            pasos.append(Step(i, "EMIT(?)", tok.value or tok.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
 
     while ops:
-        if ops[-1].kind in ("LP", "RP"):
-            raise ValueError("Paréntesis no balanceados al final")
-        emit(ops.pop())
-        steps.append(Step(out[:], ops[:]))
+        p = ops.pop()
+        if p.kind == "LP":
+            raise ValueError("Paréntesis desbalanceados al final")
+        out.append(p.value or p.kind)
+        pasos.append(Step(len(tokens), "POP->EMIT", p.value or p.kind, " ".join(out), "".join(o.value or o.kind for o in ops)))
+    return out, pasos
 
-    return out, steps
 
 # ===================== Expansión canónica de cuantificadores =================
-def _repeat_expr(base: List[str], m: int, n: Optional[int]) -> List[str]:
-    """
-    Expande base^{m} (o {m,} o {m,n}) en postfix usando CONCAT y ALT con ε.
-    """
-    if m < 0 or (n is not None and n < m):
-        raise ValueError("{m,n} inválido")
-
-    out: List[str] = []
-    # base^m
-    for _ in range(m):
-        out.extend(base)
-        out.append("CONCAT")
-
-    if n is None:
-        # {m,} => base^m base*
-        # Una sola STAR sobre un bloque "base"
-        out.extend(base)
-        out.append("STAR")
-        out.append("CONCAT")
-        return out
-
-    if n == m:
-        return out  # exactamente m
-
-    # {m,n}  ==> base^m ( ε | base | base·base | ... | base^(n-m) )
-    # OR encadenado: t0 | t1 | ... | tk
-    # Cada ti = (base^i) con i ∈ [0, n-m]
-    alts: List[List[str]] = []
-    for i in range(0, n - m + 1):
-        block: List[str] = []
-        for _ in range(i):
-            block.extend(base)
-            block.append("CONCAT")
-        alts.append(block if block else ["ε"])  # i=0 ⇒ ε
-
-    # Alternar en postfix: a | b | c ⇒ a b ALT c ALT
-    alt_seq: List[str] = []
-    alt_seq.extend(alts[0])
-    for part in alts[1:]:
-        alt_seq.extend(part)
-        alt_seq.append("ALT")
-
-    out.extend(alt_seq)
-    out.append("CONCAT")  # base^m CONCAT (alternativa)
+def _repeat_expr(expr_tokens: List[str], k: int) -> List[str]:
+    if k == 0:
+        return ["ε"]
+    out = expr_tokens[:]
+    for _ in range(1, k):
+        out = out + expr_tokens + ["·"]
     return out
 
+
 def expand_postfix(postfix: List[str]) -> List[str]:
-    """
-    Reescribe postfix para eliminar PLUS, QMARK y REPEAT, dejando solo:
-      - LIT, CLASS, ANY, ALT, CONCAT y STAR
-    """
-    out: List[str] = []
-    stack: List[List[str]] = []
-    i = 0
-    n = len(postfix)
-
-    def pop_atom() -> List[str]:
-        if not stack:
-            raise ValueError("Postfix inválido para expansión: falta operando")
-        return stack.pop()
-
-    while i < n:
-        sym = postfix[i]
-        if sym in ("ALT", "CONCAT"):
-            b = pop_atom()
-            a = pop_atom()
-            stack.append(a + b + [sym])
-        elif sym == "STAR":
-            a = pop_atom()
-            stack.append(a + ["STAR"])
-        elif sym == "PLUS":
-            a = pop_atom()
-            stack.append(a + a + ["CONCAT", "STAR"])  # x x CONCAT STAR
-        elif sym == "QMARK":
-            a = pop_atom()
-            stack.append(["ε"] + a + ["ALT"])
-        elif sym.startswith("{") and sym.endswith("}"):
-            # ej: {3}, {2,}, {1,4}
-            a = pop_atom()
-            content = sym[1:-1]
-            if "," in content:
-                parts = content.split(",")
+    st: List[List[str]] = []
+    for t in postfix:
+        if t == "*":
+            a = st.pop()
+            st.append(a + ["*"])
+        elif t == "+":
+            a = st.pop()
+            st.append(a + a + ["*", "·"])
+        elif t == "?":
+            a = st.pop()
+            st.append(a + ["ε", "|"])
+        elif t == "·":
+            b = st.pop(); a = st.pop()
+            st.append(a + b + ["·"])
+        elif t == "|":
+            b = st.pop(); a = st.pop()
+            st.append(a + b + ["|"])
+        elif t.startswith("{") and t.endswith("}"):
+            a = st.pop()
+            parts = t[1:-1].split(",")
+            if len(parts) == 1:
                 m = int(parts[0])
-                if parts[1] == "":
-                    nrep = None
-                else:
-                    nrep = int(parts[1])
+                st.append(_repeat_expr(a, m))
+            elif parts[1] == "":
+                m = int(parts[0])
+                st.append(_repeat_expr(a, m) + a + ["*", "·"])
             else:
-                m = int(content)
-                nrep = None
-            stack.append(_repeat_expr(a, m, nrep))
+                m = int(parts[0]); n = int(parts[1])
+                alts: List[str] = []
+                for k in range(m, n + 1):
+                    ek = _repeat_expr(a, k)
+                    if not alts:
+                        alts = ek
+                    else:
+                        alts = alts + ek + ["|"]
+                st.append(alts)
         else:
-            # átomo literal: símbolo, clase, '.', 'ε'
-            stack.append([sym])
-        i += 1
+            st.append([t])
+    if len(st) != 1:
+        raise ValueError("Postfix inválido (sobraron elementos)")
+    return st[0]
 
-    if len(stack) != 1:
-        raise ValueError("Postfix inválido tras expansión")
-    return stack[0]
 
 # =============================== Thompson AFN ================================
-@dataclass
+@dataclass(eq=False)
 class State:
     id: int
-    trans: Dict[str, List[int]]  # símbolo -> destinos
-    eps: List[int]               # transiciones ε
+    edges: Dict[str, Set["State"]]
+    def __hash__(self) -> int:
+        return hash(self.id)
+
 
 class NFA:
-    def __init__(self, eps_symbol: str = DEFAULT_EPS):
-        self.states: List[State] = []
-        self.start: int = self.add_state()
-        self.accept: int = self.add_state()
-        self.eps = eps_symbol
+    def __init__(self, eps: str = DEFAULT_EPS):
+        self._next_id = 0
+        self.start: Optional[State] = None
+        self.accept: Optional[State] = None
+        self.states: Set[State] = set()
+        self.eps = eps
 
-    def add_state(self) -> int:
-        sid = len(self.states)
-        self.states.append(State(sid, defaultdict(list), []))
-        return sid
+    def _new_state(self) -> State:
+        s = State(self._next_id, {})
+        self._next_id += 1
+        self.states.add(s)
+        return s
 
-    def add_trans(self, u: int, sym: str, v: int):
-        self.states[u].trans[sym].append(v)
+    def _add_edge(self, u: State, sym: str, v: State):
+        u.edges.setdefault(sym, set()).add(v)
 
-    def add_eps(self, u: int, v: int):
-        self.states[u].eps.append(v)
+    def _lit(self, symbol: str) -> Tuple[State, State]:
+        s, t = self._new_state(), self._new_state()
+        if symbol == "ε":
+            self._add_edge(s, self.eps, t)
+        elif symbol.startswith("[") and symbol.endswith("]"):
+            for ch in expand_class(symbol[1:-1]):
+                self._add_edge(s, ch, t)
+        elif symbol == "ANY":
+            self._add_edge(s, "ANY", t)
+        else:
+            self._add_edge(s, symbol, t)
+        return s, t
 
-    @staticmethod
-    def _concat(nfa1: "NFA", nfa2: "NFA") -> "NFA":
-        # Conecta accept de nfa1 al start de nfa2 por ε
-        out = NFA(nfa1.eps)
-        out.states = [State(s.id, defaultdict(list, {k: v[:] for k, v in s.trans.items()}), s.eps[:]) for s in nfa1.states]
-        offset = len(out.states)
-        # redirige accept de nfa1 a start de nfa2
-        out.add_eps(nfa1.accept, nfa2.start + offset)
-        # copy nfa2
-        for s in nfa2.states:
-            new_trans = defaultdict(list, {k: [x + offset for x in v] for k, v in s.trans.items()})
-            new_eps = [x + offset for x in s.eps]
-            out.states.append(State(s.id + offset, new_trans, new_eps))
-        out.start = nfa1.start
-        out.accept = nfa2.accept + offset
-        return out
+    def _concat(self, a: Tuple[State, State], b: Tuple[State, State]) -> Tuple[State, State]:
+        self._add_edge(a[1], self.eps, b[0])
+        return a[0], b[1]
 
-    @staticmethod
-    def _alt(nfa1: "NFA", nfa2: "NFA") -> "NFA":
-        out = NFA(nfa1.eps)
-        # copiar nfa1 y nfa2 con offsets
-        off1 = 0
-        for s in nfa1.states:
-            out.states.append(State(s.id, defaultdict(list, {k: v[:] for k, v in s.trans.items()}), s.eps[:]))
-        off2 = len(out.states)
-        for s in nfa2.states:
-            new_trans = defaultdict(list, {k: [x + off2 for x in v] for k, v in s.trans.items()})
-            new_eps = [x + off2 for x in s.eps]
-            out.states.append(State(s.id + off2, new_trans, new_eps))
+    def _alt(self, a: Tuple[State, State], b: Tuple[State, State]) -> Tuple[State, State]:
+        s, t = self._new_state(), self._new_state()
+        self._add_edge(s, self.eps, a[0]); self._add_edge(s, self.eps, b[0])
+        self._add_edge(a[1], self.eps, t); self._add_edge(b[1], self.eps, t)
+        return s, t
 
-        # nuevo start y accept
-        new_start = len(out.states)
-        out.states.append(State(new_start, defaultdict(list), []))
-        new_accept = len(out.states)
-        out.states.append(State(new_accept, defaultdict(list), []))
+    def _star(self, a: Tuple[State, State]) -> Tuple[State, State]:
+        s, t = self._new_state(), self._new_state()
+        self._add_edge(s, self.eps, a[0]); self._add_edge(s, self.eps, t)
+        self._add_edge(a[1], self.eps, a[0]); self._add_edge(a[1], self.eps, t)
+        return s, t
 
-        # ε a starts originales
-        out.add_eps(new_start, nfa1.start + off1)
-        out.add_eps(new_start, nfa2.start + off2)
-        # aceptar desde accepts originales
-        out.add_eps(nfa1.accept + off1, new_accept)
-        out.add_eps(nfa2.accept + off2, new_accept)
-
-        out.start = new_start
-        out.accept = new_accept
-        return out
-
-    @staticmethod
-    def _star(nfa1: "NFA") -> "NFA":
-        out = NFA(nfa1.eps)
-        for s in nfa1.states:
-            out.states.append(State(s.id, defaultdict(list, {k: v[:] for k, v in s.trans.items()}), s.eps[:]))
-        # nuevo start y accept
-        new_start = len(out.states)
-        out.states.append(State(new_start, defaultdict(list), []))
-        new_accept = len(out.states)
-        out.states.append(State(new_accept, defaultdict(list), []))
-        # ε-transiciones
-        out.add_eps(new_start, nfa1.start)
-        out.add_eps(new_start, new_accept)
-        out.add_eps(nfa1.accept, nfa1.start)
-        out.add_eps(nfa1.accept, new_accept)
-        out.start = new_start
-        out.accept = new_accept
-        return out
-
-    @staticmethod
-    def _symbol(sym: str, eps: str) -> "NFA":
-        out = NFA(eps)
-        # reconstruir con dos estados (start->accept) por 'sym'
-        out.states = []
-        s = out.add_state()
-        t = out.add_state()
-        out.add_trans(s, sym, t)
-        out.start, out.accept = s, t
-        return out
-
-    @staticmethod
-    def _epsilon(eps: str) -> "NFA":
-        out = NFA(eps)
-        out.states = []
-        s = out.add_state()
-        t = out.add_state()
-        out.add_eps(s, t)
-        out.start, out.accept = s, t
-        return out
-
-    @staticmethod
-    def build_from_postfix(postfix: List[str], eps_symbol: str = DEFAULT_EPS) -> "NFA":
-        """
-        Construye AFN por Thompson a partir de postfix
-        """
-        st: List[NFA] = []
-        for sym in postfix:
-            if sym == "ALT":
-                b = st.pop()
-                a = st.pop()
-                st.append(NFA._alt(a, b))
-            elif sym == "CONCAT":
-                b = st.pop()
-                a = st.pop()
-                st.append(NFA._concat(a, b))
-            elif sym == "STAR":
-                a = st.pop()
-                st.append(NFA._star(a))
-            elif sym == "ε":
-                st.append(NFA._epsilon(eps_symbol))
+    def build_from_postfix(self, pf: List[str]):
+        st: List[Tuple[State, State]] = []
+        for tok in pf:
+            if tok == "·":
+                b = st.pop(); a = st.pop()
+                st.append(self._concat(a, b))
+            elif tok == "|":
+                b = st.pop(); a = st.pop()
+                st.append(self._alt(a, b))
+            elif tok == "*":
+                a = st.pop(); st.append(self._star(a))
             else:
-                st.append(NFA._symbol(sym, eps_symbol))
+                st.append(self._lit(tok))
         if len(st) != 1:
-            raise ValueError("Postfix inválida para Thompson")
-        return st[0]
+            raise ValueError("Postfix inválido para Thompson")
+        self.start, self.accept = st[0]
 
-    # -------- Simulación AFN --------
-    def eclosure(self, S: Set[int]) -> Set[int]:
-        """ ε-clausura de un conjunto de estados. """
-        stack = list(S)
-        seen = set(S)
+    def _eps_closure(self, S: Set[State]) -> Set[State]:
+        stack = list(S); seen = set(S)
         while stack:
             u = stack.pop()
-            for v in self.states[u].eps:
+            for v in u.edges.get(self.eps, ()):
                 if v not in seen:
-                    seen.add(v)
-                    stack.append(v)
+                    seen.add(v); stack.append(v)
         return seen
 
-    def move(self, S: Set[int], sym: str) -> Set[int]:
-        T: Set[int] = set()
+    def _move(self, S: Set[State], sym: str) -> Set[State]:
+        out: Set[State] = set()
         for u in S:
-            for v in self.states[u].trans.get(sym, []):
-                T.add(v)
-        return T
+            for v in u.edges.get(sym, ()):
+                out.add(v)
+            for v in u.edges.get("ANY", ()):
+                out.add(v)
+        return out
 
-    def accepts(self, w: str, any_symbol: Optional[str] = None) -> bool:
-        """
-        Simula el AFN sobre w.
-        """
-        cur = self.eclosure({self.start})
+    def accepts(self, w: str) -> bool:
+        if self.start is None or self.accept is None:
+            return False
+        current = self._eps_closure({self.start})
         for ch in w:
-            nxt = set()
-            # movimientos explícitos
-            nxt |= self.move(cur, ch)
-            # si hay un comodín 'ANY'
-            if any_symbol is not None:
-                nxt |= self.move(cur, "ANY")
-            cur = self.eclosure(nxt)
-        return self.accept in cur
+            current = self._eps_closure(self._move(current, ch))
+            if not current:
+                break
+        return self.accept in current
+
 
 # ============================== Utilidades varias ============================
-def expand_class(val: str) -> Set[str]:
-    """
-    Convierte el payload de un token CLASS en un conjunto de caracteres.
-    """
-    negate = False
-    s = val
-    if val.startswith("^"):
-        negate = True
-        s = val[1:]
-    chars: Set[str] = set(s)
-    return chars if not negate else set()  # Negado se resuelve más adelante
+def expand_class(payload: str) -> Set[str]:
+    out: Set[str] = set()
+    i = 0
+    L = len(payload)
+    while i < L:
+        c = payload[i]
+        if c == "\\" and i + 1 < L:
+            out.add(payload[i + 1]); i += 2; continue
+        if i + 2 < L and payload[i + 1] == "-":
+            a, b = payload[i], payload[i + 2]
+            lo, hi = (ord(a), ord(b)) if ord(a) <= ord(b) else (ord(b), ord(a))
+            for code in range(lo, hi + 1):
+                out.add(chr(code))
+            i += 3
+        else:
+            out.add(c); i += 1
+    return out
+
 
 # ============================== Dibujo AFN ===================================
-import matplotlib.pyplot as plt
-import math
+def layout_positions_nfa(nfa: NFA) -> Dict[State, Tuple[float, float]]:
+    adj: Dict[State, Set[State]] = {s: set() for s in nfa.states}
+    for s in nfa.states:
+        for dests in s.edges.values():
+            adj[s] |= dests
 
-def layout_positions_nfa(nfa: NFA) -> Dict[int, Tuple[float, float]]:
-    """
-    Layout radial simple: start y accept más separados, intermedios en círculo.
-    """
-    n = len(nfa.states)
-    if n <= 2:
-        return {0: (0.0, 0.0), 1: (2.0, 0.0)}
-    R = 4.0
-    center = (0.0, 0.0)
-    pos: Dict[int, Tuple[float, float]] = {}
-    # coloca start y accept
-    pos[nfa.start] = (-3.0, 0.0)
-    pos[nfa.accept] = (3.0, 0.0)
-    idx = 0
-    for s in range(n):
-        if s in (nfa.start, nfa.accept):
-            continue
-        angle = 2 * math.pi * (idx / max(1, n - 2))
-        pos[s] = (center[0] + R * math.cos(angle), center[1] + R * math.sin(angle))
-        idx += 1
+    dist: Dict[State, int] = {}
+    if nfa.start is not None:
+        dist[nfa.start] = 0
+        q = deque([nfa.start])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in dist:
+                    dist[v] = dist[u] + 1
+                    q.append(v)
+    maxd = max(dist.values()) if dist else 0
+    for s in nfa.states:
+        dist.setdefault(s, maxd)
+
+    levels: Dict[int, List[State]] = {}
+    for s, d in dist.items():
+        levels.setdefault(d, []).append(s)
+
+    pos: Dict[State, Tuple[float, float]] = {}
+    sep_x, sep_y = 2.4, 1.6
+    for d in sorted(levels):
+        ys = sorted(levels[d], key=lambda z: z.id)
+        n = len(ys)
+        for i, s in enumerate(ys):
+            y = (i - (n - 1) / 2.0) * sep_y
+            x = d * sep_x
+            pos[s] = (x, y)
     return pos
 
-def draw_nfa_png(nfa: NFA, path: str):
+
+def draw_nfa_png(nfa: NFA, filename_png: str):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, FancyArrowPatch, Arc
+
     pos = layout_positions_nfa(nfa)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    # dibujar estados
-    for sid, (x, y) in pos.items():
-        circle = plt.Circle((x, y), 0.35, fill=False, linewidth=2)
-        ax.add_patch(circle)
-        ax.text(x, y, f"S{sid}", ha="center", va="center")
-    # doble círculo para accept
-    ax.add_patch(plt.Circle(pos[nfa.accept], 0.28, fill=False, linewidth=2))
+    xs = [p[0] for p in pos.values()] + [-2]
+    ys = [p[1] for p in pos.values()] + [0]
+    x_min, x_max = min(xs) - 1.2, max(xs) + 1.2
+    y_min, y_max = min(ys) - 1.2, max(ys) + 1.2
 
-    # dibujar transiciones
-    for s in nfa.states:
-        x1, y1 = pos[s.id]
-        for sym, dests in s.trans.items():
-            for v in dests:
-                x2, y2 = pos[v]
-                ax.annotate("",
-                            xy=(x2, y2), xytext=(x1, y1),
-                            arrowprops=dict(arrowstyle="->", lw=1.5))
-                xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
-                ax.text(xm, ym + 0.15, sym, fontsize=9, ha="center")
-        for v in s.eps:
-            x2, y2 = pos[v]
-            ax.annotate("",
-                        xy=(x2, y2), xytext=(x1, y1),
-                        arrowprops=dict(arrowstyle="->", lw=1, linestyle="dashed"))
-            xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
-            ax.text(xm, ym - 0.2, DEFAULT_EPS, fontsize=8, ha="center", style="italic")
-
-    ax.set_aspect("equal")
+    fig, ax = plt.subplots(figsize=(max(6, (x_max - x_min) * 1.2),
+                                    max(4, (y_max - y_min) * 1.2)))
+    ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max)
     ax.axis("off")
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    plt.tight_layout()
-    fig.savefig(path, dpi=160)
+
+    R = 0.28
+
+    for s, (x, y) in pos.items():
+        circ = Circle((x, y), R, fill=False, lw=2)
+        ax.add_patch(circ)
+        if nfa.accept is not None and s.id == nfa.accept.id:
+            circ2 = Circle((x, y), R - 0.06, fill=False, lw=2)
+            ax.add_patch(circ2)
+        ax.text(x, y, str(s.id), ha="center", va="center", fontsize=10)
+
+    if nfa.start is not None:
+        x0, y0 = pos[nfa.start]
+        arr = FancyArrowPatch((-2, y0), (x0 - R, y0), arrowstyle="->", lw=1.6, mutation_scale=14)
+        ax.add_patch(arr)
+
+    for s, (x1, y1) in pos.items():
+        for sym, dests in s.edges.items():
+            for t in dests:
+                x2, y2 = pos[t]
+                if s is t:
+                    arc = Arc((x1, y1 + R + 0.20), 0.8, 0.6, angle=0, theta1=220, theta2=-40, lw=1.5)
+                    ax.add_patch(arc)
+                    ax.text(x1 + 0.05, y1 + R + 0.7, sym, fontsize=9)
+                    continue
+                arr = FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="->", lw=1.5,
+                                      mutation_scale=12, shrinkA=12, shrinkB=12)
+                ax.add_patch(arr)
+                xm, ym = (x1 + x2) / 2.0, (y1 + y2) / 2.0 + 0.15
+                ax.text(xm, ym, sym, fontsize=9)
+
+    fig.tight_layout()
+    if not filename_png.lower().endswith(".png"):
+        filename_png += ".png"
+    fig.savefig(filename_png, dpi=150)
     plt.close(fig)
 
-# ============================== Front–End Parte A ============================
-def regex_to_postfix(regex: str) -> Tuple[List[str], List[Step], List[str]]:
-    """
-    Pipeline A:
-      regex (infix) -> tokens -> +CONCAT -> postfix -> expansión (sin +/?/{})
-    Devuelve (postfix_original, steps_shunting, postfix_expandida)
-    """
-    toks = tokenize(regex)
-    toks2 = add_concat(toks)
-    postfix, steps = shunting_yard(toks2)
-    expanded = expand_postfix(postfix)
-    return postfix, steps, expanded
 
-def build_nfa_from_regex(regex: str, eps_symbol: str = DEFAULT_EPS) -> Tuple[NFA, List[str], List[Step], List[str]]:
-    postfix, steps, expanded = regex_to_postfix(regex)
-    nfa = NFA.build_from_postfix(expanded, eps_symbol=eps_symbol)
-    return nfa, postfix, steps, expanded
+# ============================== Front–End Parte A ============================
+def regex_to_postfix(expr: str) -> Tuple[List[str], List[Step]]:
+    toks = add_concat(tokenize(expr))
+    postfix, steps = shunting_yard(toks)
+    canonical = expand_postfix(postfix)
+    return canonical, steps
+
+
+def build_nfa_from_regex(expr: str, eps: str = DEFAULT_EPS) -> Tuple[NFA, List[str]]:
+    pf, _steps = regex_to_postfix(expr)
+    nfa = NFA(eps=eps)
+    nfa.build_from_postfix(pf)
+    return nfa, pf
+
 
 # ======================= Subconjuntos: AFN -> AFD ============================
 @dataclass(eq=False)
@@ -565,15 +471,15 @@ class DFA:
         self.start: Optional[int] = None
         self.alphabet: Set[str] = set(alphabet)  # puede incluir OTHER
 
-    def add_state(self, accept: bool=False) -> int:
+    def add_state(self, accept: bool) -> int:
         i = len(self.states)
         self.states[i] = DfaState(i, {}, accept)
         if self.start is None:
             self.start = i
         return i
 
-    def add_trans(self, u: int, a: str, v: int):
-        self.states[u].trans[a] = v
+    def add_trans(self, u: int, sym: str, v: int):
+        self.states[u].trans[sym] = v
 
     def accepts(self, w: str) -> bool:
         if self.start is None:
@@ -607,32 +513,33 @@ class DFA:
 def nfa_alphabet(nfa: NFA) -> Set[str]:
     Σ: Set[str] = set()
     for s in nfa.states:
-        for a in s.trans.keys():
-            if a != "ANY":
-                Σ.add(a)
+        for a in s.edges.keys():
+            if a == nfa.eps or a == "ANY":
+                continue
+            Σ.add(a)
     return Σ
 
 
-def eclosure(nfa: NFA, S: Set[int]) -> Set[int]:
-    return nfa.eclosure(S)
+def eclosure(nfa: NFA, S: Set[State]) -> Set[State]:
+    return nfa._eps_closure(S)
 
 
-def move_set(nfa: NFA, S: Set[int], sym: str) -> Set[int]:
-    T: Set[int] = set()
+def move_set(nfa: NFA, S: Set[State], sym: str) -> Set[State]:
+    out = set()
     for u in S:
-        T |= set(nfa.states[u].trans.get(sym, []))
-    return T
+        out |= u.edges.get(sym, set())
+    return out
 
 
-def build_dfa_from_nfa(nfa: NFA) -> Tuple[DFA, Dict[FrozenSet[int], int]]:
+def build_dfa_from_nfa(nfa: NFA) -> Tuple[DFA, Dict[FrozenSet[State], int]]:
     Σ = nfa_alphabet(nfa)
-    has_any = any("ANY" in s.trans for s in nfa.states)
+    has_any = any("ANY" in s.edges for s in nfa.states)
     alphabet = set(Σ)
     if has_any:
         alphabet.add(OTHER)
 
     dfa = DFA(alphabet=alphabet)
-    subset_id: Dict[FrozenSet[int], int] = {}
+    subset_id: Dict[FrozenSet[State], int] = {}
 
     start_set = eclosure(nfa, {nfa.start})
     start_key = frozenset(start_set)
@@ -654,7 +561,6 @@ def build_dfa_from_nfa(nfa: NFA) -> Tuple[DFA, Dict[FrozenSet[int], int]]:
                 subset_id[key] = qid
                 Q.append(key)
             dfa.add_trans(u, a, subset_id[key])
-
         if has_any:
             U_raw = move_set(nfa, T, "ANY")
             U = eclosure(nfa, U_raw)
@@ -687,21 +593,15 @@ def hopcroft_minimize(dfa: DFA) -> DFA:
     F = {s.id for s in dfa.states.values() if s.accept}
     NF = set(dfa.states.keys()) - F
 
-    # Partición inicial
-    P: List[Set[int]] = []
-    if F:  P.append(F)
-    if NF: P.append(NF)
-    W: List[Set[int]] = [min(F, key=len) if F else set()] if F else [NF]
+    P = [F, NF]
+    W = [F.copy(), NF.copy()]
+    trans = {s: dfa.states[s].trans.copy() for s in states}
 
     while W:
         A = W.pop()
         for a in Σ:
-            # X = {q | δ(q,a) ∈ A}
-            X = set()
-            for q in states:
-                if dfa.states[q].trans.get(a, None) in A:
-                    X.add(q)
-            newP: List[Set[int]] = []
+            X = {s for s in states if trans[s][a] in A}
+            newP = []
             for Y in P:
                 inter = Y & X
                 diff = Y - X
@@ -716,14 +616,13 @@ def hopcroft_minimize(dfa: DFA) -> DFA:
                     newP.append(Y)
             P = newP
 
-    # Construcción del DFA mínimo
-    block_id: Dict[int, int] = {}
+    block_id = {}
     for i, block in enumerate(P):
         for s in block:
             block_id[s] = i
 
     min_dfa = DFA(alphabet=set(dfa.alphabet))
-    new_state_map: Dict[int, int] = {}
+    new_state_map = {}
     for i, block in enumerate(P):
         accept = any(dfa.states[s].accept for s in block)
         new_state_map[i] = min_dfa.add_state(accept)
@@ -735,15 +634,15 @@ def hopcroft_minimize(dfa: DFA) -> DFA:
             j = block_id[to_old]
             min_dfa.add_trans(new_state_map[i], a, new_state_map[j])
 
-    if dfa.start is not None:
-        min_dfa.start = new_state_map[block_id[dfa.start]]
+    start_block = block_id[dfa.start]
+    min_dfa.start = new_state_map[start_block]
     return min_dfa
 
 
 # ============================== Dibujo AFD ===================================
 def layout_positions_dfa(dfa: DFA) -> Dict[int, Tuple[float, float]]:
     adj = {i: set(s.trans.values()) for i, s in dfa.states.items()}
-    dist: Dict[int, int] = {}
+    dist = {}
     if dfa.start is not None:
         dist[dfa.start] = 0
         q = deque([dfa.start])
@@ -756,10 +655,10 @@ def layout_positions_dfa(dfa: DFA) -> Dict[int, Tuple[float, float]]:
     maxd = max(dist.values()) if dist else 0
     for s in dfa.states:
         dist.setdefault(s, maxd)
-    levels: Dict[int, List[int]] = {}
+    levels = {}
     for s, d in dist.items():
         levels.setdefault(d, []).append(s)
-    pos: Dict[int, Tuple[float, float]] = {}
+    pos = {}
     sep_x, sep_y = 2.6, 1.6
     for d in sorted(levels):
         ys = sorted(levels[d])
@@ -771,11 +670,12 @@ def layout_positions_dfa(dfa: DFA) -> Dict[int, Tuple[float, float]]:
     return pos
 
 
-from matplotlib.patches import Circle, FancyArrowPatch, Arc
-
 def draw_dfa_png(dfa: DFA, filename_png: str):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, FancyArrowPatch, Arc
+
     pos = layout_positions_dfa(dfa)
-    xs = [p[0] for p in pos.values()] + [0]
+    xs = [p[0] for p in pos.values()] + [-2]
     ys = [p[1] for p in pos.values()] + [0]
     x_min, x_max = min(xs) - 1.2, max(xs) + 1.2
     y_min, y_max = min(ys) - 1.2, max(ys) + 1.2
@@ -833,9 +733,7 @@ def dfa_equiv(d1: DFA, d2: DFA) -> bool:
     Q = deque([start])
     while Q:
         u1, u2 = Q.popleft()
-        a1 = d1c.states[u1].accept
-        a2 = d2c.states[u2].accept
-        if a1 != a2:
+        if d1c.states[u1].accept != d2c.states[u2].accept:
             return False
         for a in Σ:
             v1 = d1c.states[u1].trans[a]
@@ -850,7 +748,7 @@ def dfa_equiv(d1: DFA, d2: DFA) -> bool:
 def random_words(Σ: Set[str], trials: int, max_len: int = 6, seed: int = 123) -> List[str]:
     rng = random.Random(seed)
     letters = sorted(Σ)
-    out: List[str] = []
+    out = []
     for _ in range(trials):
         L = rng.randint(0, max_len)
         if letters:
@@ -875,3 +773,89 @@ def diff_test(nfa: NFA, dfa: DFA, trials: int = 200, max_len: int = 6, alphabet_
         else:
             mism += 1
     return oks, mism
+
+
+# ============================== CLI principal ================================
+def main():
+    ap = argparse.ArgumentParser(description="Proyecto completo: Parte A + Parte B (AFN, AFD, Minimización, PNGs y verificación)")
+    ap.add_argument("--mode", choices=["A", "B", "ALL"], default="ALL", help="A: solo AFN; B: AFN→AFD+min; ALL: ambos")
+    g_in = ap.add_mutually_exclusive_group(required=True)
+    g_in.add_argument("--regex", help="Expresión regular única (infix)")
+    g_in.add_argument("--input", help="Archivo con ER (una por línea)")
+
+    g_w = ap.add_mutually_exclusive_group()
+    g_w.add_argument("--word", help="Cadena w única para todas las ER")
+    g_w.add_argument("--words", help="Archivo con cadenas w (paralelo a --input)")
+
+    ap.add_argument("--alphabet", help="Pista de alfabeto para test aleatorios, ej. 'ab'")
+    ap.add_argument("--outdir", default="out_all", help="Carpeta de salida para PNGs")
+    ap.add_argument("--eps", default=DEFAULT_EPS, help="Símbolo visible para ε (usado en los dibujos)")
+    ap.add_argument("--show-steps", action="store_true", help="Imprime pasos del Shunting Yard (modo A/ALL)")
+
+    ap.add_argument("--check", action="store_true", help="Verifica equivalencia DFA ≡ DFAmin (modo B/ALL)")
+    ap.add_argument("--random", type=int, default=0, help="Corre pruebas aleatorias NFA↔DFA con N muestras (modo B/ALL)")
+
+    args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # Cargar ERs
+    if args.regex is not None:
+        regexes = [args.regex.strip()]
+    else:
+        with open(args.input, "r", encoding="utf-8") as f:
+            regexes = [ln.strip() for ln in f if ln.strip()]
+
+    # Cargar w
+    if args.word is not None:
+        words = [args.word] * len(regexes)
+    elif args.words is not None:
+        with open(args.words, "r", encoding="utf-8") as f:
+            words = [ln.rstrip("\n") for ln in f]
+        if len(words) < len(regexes):
+            words += [""] * (len(regexes) - len(words))
+    else:
+        words = [""] * len(regexes)
+
+    for i, (reg, w) in enumerate(zip(regexes, words), 1):
+        print("=" * 80)
+        print(f"[{i}] ER: {reg}")
+        pf, steps = regex_to_postfix(reg)
+        print("POSTFIX (canónica):", " ".join(pf))
+
+        # ----- Parte A -----
+        nfa = NFA(eps=args.eps)
+        nfa.build_from_postfix(pf)
+        if args.show_steps:
+            print("\nPasos Shunting-Yard:")
+            for st in steps:
+                print(f"  [{st.i:02d}] {st.accion:10s} {st.token:10s} OUT: {st.salida:30s} OPS: {st.pila}")
+        if args.mode in ("A", "ALL"):
+            nfa_png = os.path.join(args.outdir, f"afn_{i}.png")
+            draw_nfa_png(nfa, nfa_png)
+            print(f"Imagen AFN -> {nfa_png}")
+            w0 = "" if w is None else w
+            print(f"w = {repr(w0)}  =>  NFA: {'sí' if nfa.accepts(w0) else 'no'}")
+
+        # ----- Parte B -----
+        if args.mode in ("B", "ALL"):
+            dfa, subset_map = build_dfa_from_nfa(nfa)
+            dfa_min = hopcroft_minimize(clone_dfa(dfa))
+            dfa_png = os.path.join(args.outdir, f"afd_{i}.png")
+            dfa_min_png = os.path.join(args.outdir, f"afd_min_{i}.png")
+            draw_dfa_png(dfa, dfa_png); draw_dfa_png(dfa_min, dfa_min_png)
+            print(f"Imagen AFD     -> {dfa_png}")
+            print(f"Imagen AFDmin  -> {dfa_min_png}")
+            w0 = "" if w is None else w
+            a_nfa = nfa.accepts(w0); a_dfa = dfa.accepts(w0); a_min = dfa_min.accepts(w0)
+            print(f"w = {repr(w0)}  =>  NFA: {'sí' if a_nfa else 'no'} | DFA: {'sí' if a_dfa else 'no'} | DFAmin: {'sí' if a_min else 'no'}")
+            if args.check:
+                ok = dfa_equiv(dfa, dfa_min)
+                print(f"Equivalencia DFA ≡ DFAmin: {'OK' if ok else 'FALLA'}")
+            if args.random and args.random > 0:
+                oks, mism = diff_test(nfa, dfa, trials=args.random, max_len=6, alphabet_hint=args.alphabet)
+                print(f"Prueba NFA↔DFA aleatoria: OK={oks}  MISMATCH={mism}  (N={args.random})")
+                if mism > 0:
+                    print("⚠️ Hay discrepancias; revisar manejo de '.'/ANY o clases de caracteres.")
+
+if __name__ == "__main__":
+    main()
